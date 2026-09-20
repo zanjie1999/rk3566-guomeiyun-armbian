@@ -1,0 +1,163 @@
+name: Build RK3566 Speaker Armbian
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Armbian release"
+        required: true
+        default: "bookworm"
+        type: choice
+        options:
+          - bookworm
+          - trixie
+      kernel:
+        description: "OEC kernel image to use"
+        required: true
+        default: "6.1.118"
+        type: choice
+        options:
+          - "6.1.118"
+          - "latest-6.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl jq gzip util-linux mount e2fsprogs rsync xz-utils \
+            kpartx
+
+      - name: Download known-good WXY-OEC Armbian base
+        env:
+          RELEASE: ${{ inputs.release }}
+          KERNEL: ${{ inputs.kernel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+
+          mkdir -p work
+          if [[ "$KERNEL" == "6.1.118" && "$RELEASE" == "bookworm" ]]; then
+            URL="https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_bookworm_arm64_server_2025.12/Armbian_25.11.0_rockchip_wxy-oect_bookworm_6.1.118_server_2025.12.01.img.gz"
+            curl -fL "$URL" -o work/base.img.gz
+          else
+            echo "Resolving latest matching WXY-OEC image from ophub releases..."
+            API='https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases?per_page=100'
+            curl -fsSL "$API" |
+              jq -r --arg rel "$RELEASE" --arg k "$KERNEL" '
+                .[] as $r |
+                $r.assets[] |
+                select(.name | test("^Armbian_"+$rel+"_arm64_server_.*rockchip_wxy-oect.*\\.img\\.gz$")) |
+                select(($k=="latest-6.1") or (.name | contains("_"+$k+"_"))) |
+                [.updated_at, .browser_download_url, .name] | @tsv
+              ' |
+              sort -r |
+              head -n1 > work/asset.tsv
+
+            test -s work/asset.tsv
+            URL="$(cut -f2 work/asset.tsv)"
+            NAME="$(cut -f3 work/asset.tsv)"
+            echo "Using $NAME"
+            curl -fL "$URL" -o work/base.img.gz
+          fi
+
+          gzip -t work/base.img.gz
+          gunzip -c work/base.img.gz > work/base.img
+          sha256sum work/base.img > work/base.img.sha256
+
+      - name: Replace the WXY-OEC DTB with the real speaker DTB
+        run: |
+          set -euxo pipefail
+
+          test -s firmware/rk3566-speaker.dtb
+          test "$(dd if=firmware/rk3566-speaker.dtb bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' ')" = "d00dfeed"
+
+          LOOP="$(sudo losetup --find --show --partscan work/base.img)"
+          trap 'sudo umount -R work/mnt 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
+
+          sudo mkdir -p work/mnt
+          FOUND=""
+
+          for p in "${LOOP}p1" "${LOOP}p2" "${LOOP}p3" "${LOOP}p4"; do
+            [[ -b "$p" ]] || continue
+            sudo mkdir -p "work/mnt/$(basename "$p")"
+            if sudo mount -o rw "$p" "work/mnt/$(basename "$p")" 2>/dev/null; then
+              if sudo find "work/mnt/$(basename "$p")" -type f \
+                  \( -name 'rk3566-wxy-oec-turbo-4g.dtb' -o -name 'rk3566-wxy-oec-turbo-4g*.dtb' \) \
+                  | grep -q .; then
+                FOUND="$(basename "$p")"
+                break
+              fi
+              sudo umount "work/mnt/$(basename "$p")" || true
+            fi
+          done
+
+          test -n "$FOUND"
+          echo "Boot filesystem: $FOUND"
+
+          DTB_PATH="$(sudo find "work/mnt/$FOUND" -type f \
+            \( -name 'rk3566-wxy-oec-turbo-4g.dtb' -o -name 'rk3566-wxy-oec-turbo-4g*.dtb' \) \
+            | head -n1)"
+          test -n "$DTB_PATH"
+
+          echo "Replacing: $DTB_PATH"
+          sudo cp firmware/rk3566-speaker.dtb "$DTB_PATH"
+
+          # Keep every existing boot configuration unchanged; it will continue
+          # referring to the original OEC DTB filename, whose contents we replaced.
+          sudo sync
+
+          sudo umount -R "work/mnt/$FOUND" 2>/dev/null || true
+          sudo losetup -d "$LOOP"
+          trap - EXIT
+
+      - name: Verify patched image
+        run: |
+          set -euxo pipefail
+          LOOP="$(sudo losetup --find --show --partscan work/base.img)"
+          trap 'sudo umount -R work/verify 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
+          sudo mkdir -p work/verify
+
+          OK=0
+          for p in "${LOOP}p1" "${LOOP}p2" "${LOOP}p3" "${LOOP}p4"; do
+            [[ -b "$p" ]] || continue
+            d="work/verify/$(basename "$p")"
+            sudo mkdir -p "$d"
+            if sudo mount -o ro "$p" "$d" 2>/dev/null; then
+              F="$(sudo find "$d" -type f -name 'rk3566-wxy-oec-turbo-4g*.dtb' | head -n1 || true)"
+              if [[ -n "$F" ]]; then
+                GOT="$(sudo sha256sum "$F" | awk '{print $1}')"
+                EXPECTED="$(sha256sum firmware/rk3566-speaker.dtb | awk '{print $1}')"
+                test "$GOT" = "$EXPECTED"
+                OK=1
+                echo "DTB SHA256 verified: $GOT"
+                break
+              fi
+              sudo umount "$d" || true
+            fi
+          done
+          test "$OK" = 1
+
+          gzip -c -9 work/base.img > work/RK3566-Speaker-Armbian.img.gz
+          sha256sum work/RK3566-Speaker-Armbian.img.gz > work/RK3566-Speaker-Armbian.img.gz.sha256
+          cp firmware/rk3566-speaker.dtb work/rk3566-speaker.dtb
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RK3566-Speaker-Armbian
+          path: |
+            work/RK3566-Speaker-Armbian.img.gz
+            work/RK3566-Speaker-Armbian.img.gz.sha256
+            work/rk3566-speaker.dtb
+            work/base.img.sha256
+          compression-level: 0
