@@ -14,10 +14,10 @@ on:
       kernel:
         description: "OEC kernel image to use"
         required: true
-        default: "6.1.118"
+        default: "6.1.157"
         type: choice
         options:
-          - "6.1.118"
+          - "6.1.157"
           - "latest-6.1"
 
 permissions:
@@ -46,8 +46,8 @@ jobs:
           set -euxo pipefail
 
           mkdir -p work
-          if [[ "$KERNEL" == "6.1.118" && "$RELEASE" == "bookworm" ]]; then
-            URL="https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_bookworm_arm64_server_2025.12/Armbian_25.11.0_rockchip_wxy-oect_bookworm_6.1.118_server_2025.12.01.img.gz"
+          if [[ "$KERNEL" == "6.1.157" && "$RELEASE" == "bookworm" ]]; then
+            URL="https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_bookworm_arm64_server_2026.09/Armbian_26.11.0_rockchip_wxy-oect_bookworm_6.1.157_server_2026.09.14.img.gz"
             curl -fL "$URL" -o work/base.img.gz
           else
             echo "Resolving latest matching WXY-OEC image from ophub releases..."
