@@ -3,9 +3,9 @@
 目标机：RK3566 / 4GB / 800×1280 MIPI-DSI 触摸屏 / eMMC / AIC8800 SDIO WiFi / RTL8201F 百兆网口
 序列号：GM260200482
 
-**当前状态：能正常启动，屏幕、扬声器、麦克风、WiFi、电源灯/系统灯、USB 2.0 口全部可用。
-触摸的驱动、坐标、DTB 均已就绪，但测试机触摸芯片到屏幕的排线断了，无法实测；
-有线网口与 USB 3.0 口的 5V 待解。**
+**当前状态：能正常启动，屏幕、扬声器、麦克风、WiFi、电源灯/系统灯、USB 2.0 与 USB 3.0 口
+全部可用。触摸的驱动、坐标、DTB 均已就绪，但测试机触摸芯片到屏幕的排线断了，无法实测；
+只剩有线网口的 DMA reset 待解。**
 
 | 功能 | 状态 | 关键点 |
 |---|---|---|
@@ -15,8 +15,8 @@
 | 麦克风 | ✅ | PDM 阵列，card0 同时提供 `pcmC0D0c` / `pcmC0D0p` |
 | WiFi | ✅ | AIC8800；需补一个固件软链（见第四节） |
 | 电源灯 / 系统灯 | ✅ | gpio0-10 红灯常亮、gpio0-19 蓝灯 heartbeat（见 2.7） |
-| USB 2.0（OTG 口） | ✅ | `dr_mode = "host"` + `vcc5v0_otg` 常开（见 2.8） |
-| USB 3.0 口供电 | ❌ | 控制器正常（Bus 8 支持 SuperSpeed），万用表实测 VBUS 0 V，判为硬件故障（见 6.3） |
+| USB 2.0（OTG 口） | ✅ | `dr_mode = "host"` + `vcc5v0_otg` 常开，VBUS = gpio0-22（见 2.8） |
+| USB 3.0 口 | ✅ | VBUS 两级串联：`vcc5v0_usb`=gpio3-1 → `vcc5v0_host`=gpio3-2（见 6.3） |
 | 触摸 | ⚠️ | 驱动/坐标/DTB 已就绪，测试机排线断裂，无法验证（见 6.2） |
 | 有线网口 | ⚠️ | PHY 已识别（RTL8201F），`Failed to reset the dma` |
 
@@ -304,8 +304,12 @@ generic 的用途是**验证这类 loader 不会碰 OTP**，不是当日常系�
 6. 回读 sha256 必须等于源文件
 7. 断言前 16 MiB sha256 与改动前一致（证明 loader 一个字节没动）
 8. gzip -9，出 .img.gz + .sha256 + .buildinfo.txt
-9. 构建完**直接** `gh release create/upload` —— 不走 artifact，
-   因为 900 MB × 2 会把私有仓库的 artifact 配额撑爆；两个 matrix job 抢建 release 有重试
+9. 额外产出一份**独立 DTB 包**（只由 `wxy-loader` 那个 job 做，避免两个 job 抢文件名）：
+     rk3566-guomeiyun.dtb        散装，直接 cp 就能用
+     rk3566-guomeiyun-dtb.zip    dtb + .dts 源码 + README.txt 用法 + sha256
+   用途是「只想拿 DTB 换到别的 Armbian 系统上开机」，与镜像无关
+10. 构建完**直接** `gh release create/upload` —— 不走 artifact，
+    因为 900 MB × 2 会把私有仓库的 artifact 配额撑爆；两个 matrix job 抢建 release 有重试
 ```
 
 `publish_release=false` 时才退回 artifact（retention 3 天），用于只构建不发版。
@@ -427,70 +431,74 @@ hyn_ts: probe of 1-005a failed with error -2
 **结论：应该能用，只是这台测试机测不了。** 换成排线完好的机器后，如果触按方向不对，
 按 2.6 的 `rotate:3` 去调 `pos-swap` / `posx-reverse` / `posy-reverse`。
 
-### 6.3 USB 3.0 口的 5V
+### 6.3 USB 3.0 口的 5V（已解决）
 
-控制器本身是好的，`fd000000.usb`（`xhci-hcd.1.auto`）正常挂出 Bus 7（480M）和 Bus 8（5000M），
-`Host supports USB 3.0 SuperSpeed`。问题只在那一路 **VBUS 没有电压**，插什么都没反应。
+`fd000000.usb`（`xhci-hcd.1.auto`）本身一直是好的，Bus 7（480M）/ Bus 8（5000M）都在，
+`Host supports USB 3.0 SuperSpeed`。问题只是这个座的 **VBUS 一直是 0 V**。
 
-已经做过的检查：
+**根因：这一路 5V 需要两个 GPIO 同时为高，而 ophub 的 DTB 只写了一个，而且写错了脚。**
 
-| 检查 | 结果 |
-|---|---|
-| `vcc5v0_host` gpio | `gpio0-6`，与**原厂 DTB 完全一致**（不是猜的） |
-| pin 6 复用 | `pinmux-pins`: `vcc5v0-host-regulator gpio0:6 function usb group vcc5v0-host-en`，纯 GPIO 输出，没被别的功能占 |
-| 电平 | `gpio-6 ... out hi` |
-| regulator 重新初始化 | `unbind` + `bind` 一次（制造电平边沿）后仍为 `out hi` |
-| DTB 里的 5V 开关数量 | 只有 `vcc5v0_otg`(pin22)、`vcc5v0_host`(pin6)、`vcc5v0_usb`（无 gpio，中间轨）三路，**没有第三路可控开关** |
+原厂 Android DTB 里有一个自定义节点：
 
-补充一组决定性实测（逐个用 sysfs 拉 GPIO 电平，同时用万用表量两个口）：
+```dts
+io-ctl {
+    compatible = "IO-ctl";
+    IO1 = <&gpio3 1 0>;    // GPIO3_A1
+    IO2 = <&gpio3 2 0>;    // GPIO3_A2
+    IO3 = <&gpio3 3 0>;
+    ...
+};
+```
 
-| `gpio0-6` | `gpio0-22` | USB 2.0 口 | USB 3.0 口 |
+这块板的 USB3 座子供电路径是「上游 5V 开关 + HOST 使能」两级串联：
+
+| 信号 | 引脚 | 作用 | 原来的 DTB |
 |---|---|---|---|
-| hi | hi | 5 V | 0 V |
-| lo | hi | 5 V | 0 V |
-| hi | lo | **0 V** | 0 V |
+| `IO1` | **GPIO3_A1**（pin 97） | USB 5V 上游总开关 | ❌ 完全缺失（`vcc5v0_usb` 只是个没有 gpio 的占位节点）|
+| `IO2` | **GPIO3_A2**（pin 98） | HOST 口 VBUS 使能 | ❌ 写成了 `gpio0-6` |
+
+`gpio0-6` 在这块板上没有接任何东西。四轮单变量实测（sysfs 拉电平 + 万用表量电压）：
+
+| gpio0-6 | gpio0-22 | gpio3-1 | gpio3-2 | USB 2.0 口 | USB 3.0 口 |
+|---|---|---|---|---|---|
+| hi | hi | 低 | 低 | 5 V | 0 V |
+| lo | hi | 低 | 低 | 5 V | 0 V |
+| hi | lo | 低 | 低 | 0 V | 0 V |
+| hi | hi | **hi** | **hi** | 5 V | **5 V** ✅ |
 
 结论：
 
-- **USB 2.0 口由 `vcc5v0_otg`（gpio0-22）供电**，高有效，已实测有效。
-- **USB 3.0 口不受 gpio0-6 控制** —— 该脚在高、低两种电平下，这个口都没有电压输出。
+- **USB 2.0 口**（`fcc00000.usb`）由 `vcc5v0_otg` 供电，**gpio0-22**（GPIO0_C6），高有效
+- **USB 3.0 口**（`fd000000.usb`）由 `vcc5v0_host` 供电，**gpio3-2**（GPIO3_A2）；
+  其上游 `vcc5v0_usb` 用 **gpio3-1**（GPIO3_A1）
 
-`regulator_summary` 里 `vcc5v0_host` 是 `enabled`、`users=4`、`always-on`；
-pin 6 的 mux 与正常工作的 pin 22 完全一致（`function usb group vcc5v0-host-en`）；
-和 Android 原厂 DTB 逐字段对比也一致 —— 原厂只有 `vcc5v0_host`(gpio0-6) /
-`vcc5v0_otg`(gpio0-22) 两路，**没有第三路**；Linux 侧多出的 `vcc5v0_usb`
-只是没有 gpio 的中间描述轨，不控制任何开关。
+修法（已写进 DTS）：
 
-**软件侧能开的都开了、引脚映射也和原厂一致，仍然没有输出。**
-**机主用万用表实测：这个口的 VBUS 对地 0 V。** 结合已经排除的软件因素，判定为硬件问题，
-不再在 DTB 上继续尝试（补充：机主回忆这个口在 Android 下可以用，但 Android 的 DTB
-里供电定义与 Linux 完全相同，所以要么当时用的是另一个口，要么差异在 U-Boot/PMIC
-阶段的初始化，两者都不是改 DTB 能补的）。
+```dts
+vcc5v0_usb: vcc5v0-usb {
+    enable-active-high;
+    gpio = <&gpio3 1 GPIO_ACTIVE_HIGH>;   // 新增，原来没有
+};
 
-**进一步验证数据线**：从外部单独给该口的 VBUS 加 5 V 再插 USB 设备，系统**依然零枚举**。
-为排除控制器状态卡死，又对 `fd000000.usb` 做了一次 `unbind` + `bind`（xhci 完整重建，
-Bus 7/8 重新注册成功），结果仍是 `7-0:1.0` / `8-0:1.0` 两个 root hub，没有任何子设备。
+vcc5v0_host: vcc5v0-host-regulator {
+    gpio = <&gpio3 2 GPIO_ACTIVE_HIGH>;   // 原为 gpio0-6
+};
+```
 
-对比证据：同一个内核、同一份 DTB 下，USB 2.0 口（`fcc00000.usb`）的 dmesg 有完整的
-`usb 5-1: New USB device found` 记录。
+开机后验证（两个脚都由 regulator 接管，不再需要 sysfs）：
 
-**结论：这个口的 VBUS 和 D+/D- 同时不通，是整条链路失效，不是供电单点问题。**
+```
+gpio-97  ( |vcc5v0-usb          ) out hi
+gpio-98  ( |vcc5v0-host-regulato) out hi
+```
 
-排查建议（如果想修）：
+顺带修掉一处历史遗留：`rk809_sound` 里把 **GPIO3_A1 当耳机检测脚**（`hp-det-gpio`），
+那是从 ophub 参考设计抄来的，与这块板无关（该节点本来就 `disabled`，音频走
+`simple-audio-card`）。现已删除，避免以后启用 RK809 codec 时和 USB 供电抢脚。
 
-1. 先量**能用的那个 USB 2.0 口**的 VBUS 是不是 5 V，确认表笔接地与量程没问题。
-2. 量 `vcc5v0_host` 的 GPIO（gpio0-6）实际电压。注意 `/sys/kernel/debug/gpio`
-   显示的是寄存器值，**外部短路时它照样显示 `out hi`**，只有万用表才能看出真相。
-   如果 GPIO 实测 0 V，说明是引脚被拉死或映射不对；如果 GPIO 有 3.3 V 而插座 0 V，
-   问题就在两者之间。
-3. 重点看两颗元件：该口附近的**限流开关 IC**（SOT23-5 封装，常见 SY6280 / SY6283 一类）
-   和**自恢复保险丝（PPTC）**。PPTC 一旦触发会长期保持高阻，表现就是"有 5 V 输入、
-   输出 0 V"，换掉即可。
-4. 数据侧：量该口 D+ / D- 对地电阻，主机侧正常应有 **15 kΩ 下拉**。测到 MΩ 级或开路，
-   说明 D+/D- 线路断了 —— 优先怀疑 **USB-A 座子引脚根部断裂/虚焊**（经常插拔的板子最常见）。
-
-**替代方案**：USB 2.0 口已经是正常 host 且带 5 V，接一个 HUB 就能扩出多个口，
-日常使用完全够，不必为这个口纠结。
+> **教训**：这块板子的 GPIO 分配**不按参考设计走**。LED（`gpio0-10`/`gpio0-19`
+> 而不是 `gpio0-15`）、USB VBUS（`gpio3` 而不是 `gpio0`）都是这种情况。
+> 遇到外设不工作，先翻原厂 Android DTB 里的 `io-ctl` 节点，别信 ophub 那份。
 
 ---
 

@@ -7347,7 +7347,12 @@
 		usb {
 
 			vcc5v0_host_en: vcc5v0-host-en {
-				rockchip,pins = <0x00 0x06 0x00 0x130>;
+				/* 2026-11-06: GPIO3_A2, not GPIO0_A6. The vendor DTB
+				 * drives this through its io-ctl driver (IO2).
+				 * Measured: toggling gpio0-6 never changed any VBUS,
+				 * while gpio3-1 + gpio3-2 brings the USB3 socket up.
+				 */
+				rockchip,pins = <0x03 0x02 0x00 0x130>;
 				phandle = <0x14b>;
 			};
 
@@ -7564,7 +7569,10 @@
 		status = "disabled";
 		compatible = "rockchip,multicodecs-card";
 		rockchip,card-name = "rockchip-rk809";
-		hp-det-gpio = <0x84 0x01 0x01>;
+		/* 2026-11-06: dropped hp-det-gpio = <&gpio3 1 ACTIVE_LOW>.
+		 * GPIO3_A1 is the USB 5V switch (io-ctl IO1), not a headphone
+		 * detect pin. The node is disabled and audio runs through
+		 * simple-audio-card, so nothing depended on it. */
 		rockchip,format = "i2s";
 		rockchip,mclk-fs = <0x100>;
 		rockchip,cpu = <0xd7>;
@@ -7632,6 +7640,13 @@
 		regulator-name = "vcc5v0_usb";
 		regulator-always-on;
 		regulator-boot-on;
+		/* 2026-11-06: GPIO3_A1 is the upstream 5V switch shared by the
+		 * USB sockets (vendor io-ctl IO1). This node used to carry no
+		 * gpio at all, so the rail was never really switched on and
+		 * the USB3 socket stayed at 0V whatever vcc5v0_host did.
+		 */
+		enable-active-high;
+		gpio = <0x84 0x01 0x00>;
 		regulator-min-microvolt = <0x4c4b40>;
 		regulator-max-microvolt = <0x4c4b40>;
 		vin-supply = <0x149>;
@@ -7646,7 +7661,9 @@
 		regulator-min-microvolt = <0x4c4b40>;
 		regulator-max-microvolt = <0x4c4b40>;
 		enable-active-high;
-		gpio = <0x3d 0x06 0x00>;
+		/* 2026-11-06: GPIO3_A2 = vendor io-ctl IO2 (HOST enable).
+		 * Was gpio0-6, which is not wired to anything on this board. */
+		gpio = <0x84 0x02 0x00>;
 		vin-supply = <0x14a>;
 		pinctrl-names = "default";
 		pinctrl-0 = <0x14b>;
