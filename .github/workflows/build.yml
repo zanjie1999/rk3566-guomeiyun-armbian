@@ -1,4 +1,17 @@
-name: Build RK3566 Speaker Armbian
+name: Build Armbian images
+
+# 产出两个整盘镜像，同一份真机验证过的 DTB，只有 loader/uboot 来源不同：
+#
+#   wxy-loader : base = ophub rockchip_wxy-oect
+#                已实测：这台机器的 eMMC 前 16MiB 就是这个镜像自带的
+#                （0x8000 处 RKSS），能正常启动。给这台已锁的机器用。
+#
+#   generic    : base = 任意 ophub rk35xx 板型（默认 youyeetoo-yy3568）
+#                loader/uboot 不含 OEC 厂商的东西，用于不会触发 OTP 的场合。
+#
+# 两条铁律（写死在脚本里）：
+#   1. 绝不写镜像 0 .. 180MiB 这段。p1 从 180MiB 起，只挂 p1 改其中的 DTB。
+#   2. DTB 只换内容不换路径，extlinux.conf / armbianEnv.txt 同步指向同一个文件名。
 
 on:
   workflow_dispatch:
@@ -6,26 +19,66 @@ on:
       release:
         description: "Armbian release"
         required: true
-        default: "bookworm"
+        default: bookworm
         type: choice
         options:
           - bookworm
           - trixie
+          - noble
+          - resolute
       kernel:
-        description: "OEC kernel image to use"
+        description: "wxy-loader 变体的内核"
         required: true
         default: "6.1.157"
         type: choice
         options:
           - "6.1.157"
           - "latest-6.1"
+      generic_board:
+        description: "GENERIC 变体用的 ophub 板型（必须存在于 releases 里）"
+        required: true
+        default: "youyeetoo-yy3568"
+        type: string
+      generic_kernel:
+        description: "GENERIC 变体的内核：any=取该板型最新 / latest-6.1 / 具体版本"
+        required: true
+        default: "any"
+        type: string
+      publish_release:
+        description: "建 GitHub Release 并上传镜像"
+        required: true
+        default: true
+        type: boolean
+      release_tag:
+        description: "Release tag（留空 = 自动 images-YYYYMMDD-HHMM）"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
 
+env:
+  # 仓库里唯一可信的 DTB 源：真机跑通的那份
+  DTB_SRC: firmware/rk3566-guomeiyun.dtb
+  DTB_NAME: rk3566-guomeiyun.dtb
+  DTB_SUBDIR: dtb/rockchip
+
 jobs:
   build:
+    name: build / ${{ matrix.variant }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: wxy-loader
+            board: wxy-oect
+            kernel: ${{ inputs.kernel }}
+          - variant: generic
+            board: ${{ inputs.generic_board }}
+            kernel: ${{ inputs.generic_kernel }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,131 +86,353 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            curl jq gzip util-linux mount e2fsprogs rsync xz-utils \
-            kpartx
+          sudo apt-get install -y --no-install-recommends \
+            curl jq gzip util-linux mount e2fsprogs dosfstools \
+            device-tree-compiler fdisk
 
-      - name: Download known-good WXY-OEC Armbian base
+      - name: Resolve base image URL
+        id: resolve
         env:
-          RELEASE: ${{ inputs.release }}
-          KERNEL: ${{ inputs.kernel }}
+          REL: ${{ inputs.release }}
+          KERN: ${{ matrix.kernel }}
+          BOARD: ${{ matrix.board }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          # 走 token 认证，避免匿名 60 次/小时的限流
+          curl -fsSL --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            'https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases?per_page=100' \
+            -o releases.json
+          echo "release manifest: $(wc -c < releases.json) bytes"
+          test -s releases.json
 
-          mkdir -p work
-          if [[ "$KERNEL" == "6.1.157" && "$RELEASE" == "bookworm" ]]; then
-            URL="https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_bookworm_arm64_server_2026.09/Armbian_26.11.0_rockchip_wxy-oect_bookworm_6.1.157_server_2026.09.14.img.gz"
-            curl -fL "$URL" -o work/base.img.gz
-          else
-            echo "Resolving latest matching WXY-OEC image from ophub releases..."
-            API='https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases?per_page=100'
-            curl -fsSL "$API" |
-              jq -r --arg rel "$RELEASE" --arg k "$KERNEL" '
-                .[] as $r |
-                $r.assets[] |
-                select(.name | test("^Armbian_"+$rel+"_arm64_server_.*rockchip_wxy-oect.*\\.img\\.gz$")) |
-                select(($k=="latest-6.1") or (.name | contains("_"+$k+"_"))) |
-                [.updated_at, .browser_download_url, .name] | @tsv
-              ' |
-              sort -r |
-              head -n1 > work/asset.tsv
+          jq -r --arg b "$BOARD" --arg r "$REL" --arg k "$KERN" '
+            [ .[] | .assets[] | select(.name | test("\\.img\\.gz$")) ]
+            | map(select(.name | test("_rockchip_" + $b + "_" + $r + "_")))
+            | map(select(
+                if   $k == "any"         then true
+                elif $k == "latest-6.1"  then (.name | test("_6\\.1\\.[0-9]+_"))
+                else (.name | test("_" + $k + "_")) end))
+            | sort_by(.name) | last | .browser_download_url // ""
+          ' releases.json > url.txt
 
-            test -s work/asset.tsv
-            URL="$(cut -f2 work/asset.tsv)"
-            NAME="$(cut -f3 work/asset.tsv)"
-            echo "Using $NAME"
-            curl -fL "$URL" -o work/base.img.gz
+          URL="$(cat url.txt)"
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "::error::找不到 board=$BOARD release=$REL kernel=$KERN 的 rockchip 镜像，请换一个板型或内核"
+            jq -r '.[] | .assets[].name' releases.json \
+              | grep -o 'Armbian_[0-9.]*_rockchip_[a-z0-9.-]*_' \
+              | sed 's/.*rockchip_//; s/_$//' | sort -u | head -30 || true
+            exit 1
           fi
+          echo "name=$(basename "$URL")" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "BASE = $URL"
 
+      - name: Download and decompress base
+        env:
+          URL: ${{ steps.resolve.outputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -fL --retry 3 --retry-delay 5 -o work/base.img.gz "$URL"
           gzip -t work/base.img.gz
           gunzip -c work/base.img.gz > work/base.img
-          sha256sum work/base.img > work/base.img.sha256
+          rm -f work/base.img.gz
+          ls -l work/base.img
+          echo "--- disk ---"; df -h . | tail -1
 
-      - name: Replace the WXY-OEC DTB with the real speaker DTB
+      - name: Record original layout
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          python3 - <<'PY'
+          d = open('work/base.img','rb')
+          d.seek(0x8000); print('0x8000 magic :', d.read(8).hex(' '))
+          d.close()
+          PY
+          # 备份前 16MiB，稍后用来证明这块没被我们改过
+          dd if=work/base.img of=work/base-hdr16.img bs=1M count=16 status=none
+          sha256sum work/base-hdr16.img
 
-          test -s firmware/rk3566-speaker.dtb
-          test "$(dd if=firmware/rk3566-speaker.dtb bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' ')" = "d00dfeed"
+      # 策略：不修改任何启动配置，直接覆盖 extlinux.conf 的 FDT 所指向的那个文件。
+      #
+      # 为什么不改配置：extlinux 里是绝对路径 /dtb/rockchip/x.dtb，而 armbianEnv.txt
+      # 里是相对 /boot/dtb 的 rockchip/x.dtb，两边前缀不同，改配置就得同时改两处、
+      # 还各有路径规则。直接覆盖原文件，配置保持原样，零歧义。
+      #
+      # 副作用只有一个：generic 变体里那个文件还叫 rk3568-xxx.dtb，内容却是 RK3566。
+      # 为便于人工核对，额外再放一份 rk3566-guomeiyun.dtb。
+      - name: Patch DTB into boot partition
+        run: |
+          set -euo pipefail
 
+          # ---- 0. 源 DTB 自检 ----
+          test -s "$DTB_SRC"
+          MAGIC="$(dd if="$DTB_SRC" bs=1 count=4 status=none | od -An -tx1 | tr -d ' \n')"
+          test "$MAGIC" = "d00dfeed"
+          SRC_SHA="$(sha256sum "$DTB_SRC" | cut -d' ' -f1)"
+          echo "source DTB : $DTB_SRC"
+          echo "source sha : $SRC_SHA"
+          echo "model      : $(fdtget "$DTB_SRC" / model 2>/dev/null || echo '<none>')"
+          echo "compatible : $(fdtget "$DTB_SRC" / compatible 2>/dev/null || echo '<none>')"
+
+          # ---- 1. 挂 p1 ----
           LOOP="$(sudo losetup --find --show --partscan work/base.img)"
-          trap 'sudo umount -R work/mnt 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
+          MNT=work/mnt
+          cleanup() { sudo umount -R "$MNT" 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true; }
+          trap cleanup EXIT
+          sudo udevadm settle 2>/dev/null || sleep 2
 
-          sudo mkdir -p work/mnt
-          FOUND=""
-
-          for p in "${LOOP}p1" "${LOOP}p2" "${LOOP}p3" "${LOOP}p4"; do
+          BOOT=""
+          for p in "${LOOP}p1" "${LOOP}p2"; do
             [[ -b "$p" ]] || continue
-            sudo mkdir -p "work/mnt/$(basename "$p")"
-            if sudo mount -o rw "$p" "work/mnt/$(basename "$p")" 2>/dev/null; then
-              if sudo find "work/mnt/$(basename "$p")" -type f \
-                  \( -name 'rk3566-wxy-oec-turbo-4g.dtb' -o -name 'rk3566-wxy-oec-turbo-4g*.dtb' \) \
-                  | grep -q .; then
-                FOUND="$(basename "$p")"
-                break
-              fi
-              sudo umount "work/mnt/$(basename "$p")" || true
+            sudo mkdir -p "$MNT"
+            if sudo mount -o rw "$p" "$MNT" 2>/dev/null; then
+              if sudo test -d "$MNT/dtb"; then BOOT="$p"; echo "boot partition: $p"; break; fi
+              sudo umount "$MNT" || true
             fi
           done
+          if [ -z "$BOOT" ]; then echo "::error::找不到含 /dtb 的 boot 分区"; exit 1; fi
 
-          test -n "$FOUND"
-          echo "Boot filesystem: $FOUND"
+          # ---- 2. 解析出当前真正被使用的 DTB 相对路径 ----
+          TARGET_REL=""
+          if sudo test -f "$MNT/extlinux/extlinux.conf"; then
+            FDT_LINE="$(sudo sed -n 's/^[[:space:]]*FDT[[:space:]]*//p' "$MNT/extlinux/extlinux.conf" | head -n1 | tr -d '\r')"
+            echo "extlinux FDT: ${FDT_LINE:-<none>}"
+            [ -n "$FDT_LINE" ] && TARGET_REL="${FDT_LINE#/}"
+          fi
+          if [ -z "$TARGET_REL" ] && sudo test -f "$MNT/armbianEnv.txt"; then
+            ENV_FDT="$(sudo sed -n 's/^[[:space:]]*fdtfile=//p' "$MNT/armbianEnv.txt" | head -n1 | tr -d '\r')"
+            echo "armbianEnv fdtfile: ${ENV_FDT:-<none>}"
+            if [ -n "$ENV_FDT" ]; then
+              case "$ENV_FDT" in
+                dtb/*) TARGET_REL="$ENV_FDT" ;;
+                *)     TARGET_REL="dtb/$ENV_FDT" ;;
+              esac
+            fi
+          fi
+          if [ -z "$TARGET_REL" ]; then
+            TARGET_REL="$DTB_SUBDIR/$DTB_NAME"
+            echo "::warning::没读到 FDT/fdtfile，回退到 $TARGET_REL"
+          fi
+          echo "TARGET_REL = $TARGET_REL"
+          echo "$TARGET_REL" > work/target.txt
 
-          DTB_PATH="$(sudo find "work/mnt/$FOUND" -type f \
-            \( -name 'rk3566-wxy-oec-turbo-4g.dtb' -o -name 'rk3566-wxy-oec-turbo-4g*.dtb' \) \
-            | head -n1)"
-          test -n "$DTB_PATH"
-
-          echo "Replacing: $DTB_PATH"
-          sudo cp firmware/rk3566-speaker.dtb "$DTB_PATH"
-
-          # Keep every existing boot configuration unchanged; it will continue
-          # referring to the original OEC DTB filename, whose contents we replaced.
+          # ---- 3. 打印原文件摘要，然后覆盖（路径不动） ----
+          if sudo test -f "$MNT/$TARGET_REL"; then
+            echo "original sha256: $(sudo sha256sum "$MNT/$TARGET_REL" | cut -d' ' -f1)  ($(sudo stat -c%s "$MNT/$TARGET_REL") bytes)"
+          else
+            echo "::warning::目标 DTB 不存在，将新建：$TARGET_REL"
+          fi
+          sudo mkdir -p "$(dirname "$MNT/$TARGET_REL")"
+          sudo cp "$DTB_SRC" "$MNT/$TARGET_REL"
+          sudo mkdir -p "$MNT/$DTB_SUBDIR"
+          sudo cp "$DTB_SRC" "$MNT/$DTB_SUBDIR/$DTB_NAME"
           sudo sync
 
-          sudo umount -R "work/mnt/$FOUND" 2>/dev/null || true
+          # ---- 4. 回读校验 ----
+          for f in "$MNT/$TARGET_REL" "$MNT/$DTB_SUBDIR/$DTB_NAME"; do
+            GOT="$(sudo sha256sum "$f" | cut -d' ' -f1)"
+            if [ "$GOT" != "$SRC_SHA" ]; then
+              echo "::error::DTB 写入校验失败 ${f#$MNT/} got=$GOT want=$SRC_SHA"
+              exit 1
+            fi
+            echo "verified: ${f#$MNT/}  $GOT"
+          done
+
+          echo "--- extlinux.conf (unchanged) ---"
+          sudo test -f "$MNT/extlinux/extlinux.conf" && sudo cat "$MNT/extlinux/extlinux.conf" || true
+          echo "--- armbianEnv.txt (unchanged) ---"
+          sudo test -f "$MNT/armbianEnv.txt" && sudo cat "$MNT/armbianEnv.txt" || true
+
+          sudo umount -R "$MNT"
           sudo losetup -d "$LOOP"
           trap - EXIT
 
-      - name: Verify patched image
+      - name: Verify image
         run: |
-          set -euxo pipefail
-          LOOP="$(sudo losetup --find --show --partscan work/base.img)"
-          trap 'sudo umount -R work/verify 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
-          sudo mkdir -p work/verify
+          set -euo pipefail
+          SRC_SHA="$(sha256sum "$DTB_SRC" | cut -d' ' -f1)"
+          TARGET_REL="$(cat work/target.txt)"
+          echo "expecting $TARGET_REL -> $SRC_SHA"
+
+          LOOP="$(sudo losetup --find --show --partscan --read-only work/base.img)"
+          MNT=work/verify
+          cleanup() { sudo umount -R "$MNT" 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true; }
+          trap cleanup EXIT
+          sudo udevadm settle || sleep 2
 
           OK=0
-          for p in "${LOOP}p1" "${LOOP}p2" "${LOOP}p3" "${LOOP}p4"; do
+          for p in "${LOOP}p1" "${LOOP}p2"; do
             [[ -b "$p" ]] || continue
-            d="work/verify/$(basename "$p")"
-            sudo mkdir -p "$d"
-            if sudo mount -o ro "$p" "$d" 2>/dev/null; then
-              F="$(sudo find "$d" -type f -name 'rk3566-wxy-oec-turbo-4g*.dtb' | head -n1 || true)"
-              if [[ -n "$F" ]]; then
-                GOT="$(sudo sha256sum "$F" | awk '{print $1}')"
-                EXPECTED="$(sha256sum firmware/rk3566-speaker.dtb | awk '{print $1}')"
-                test "$GOT" = "$EXPECTED"
+            sudo mkdir -p "$MNT"
+            if sudo mount -o ro "$p" "$MNT" 2>/dev/null; then
+              if sudo test -f "$MNT/$TARGET_REL"; then
+                GOT="$(sudo sha256sum "$MNT/$TARGET_REL" | cut -d' ' -f1)"
+                echo "on-image $TARGET_REL : $GOT"
+                test "$GOT" = "$SRC_SHA"
+                GOT2="$(sudo sha256sum "$MNT/$DTB_SUBDIR/$DTB_NAME" | cut -d' ' -f1)"
+                echo "on-image $DTB_SUBDIR/$DTB_NAME : $GOT2"
+                test "$GOT2" = "$SRC_SHA"
+                echo "model: $(sudo fdtget "$MNT/$TARGET_REL" / model 2>/dev/null || echo '<none>')"
+                if sudo test -f "$MNT/extlinux/extlinux.conf"; then
+                  echo "extlinux FDT: $(sudo sed -n 's/^[[:space:]]*FDT[[:space:]]*/FDT /p' "$MNT/extlinux/extlinux.conf" | head -n1)"
+                fi
+                if sudo test -f "$MNT/armbianEnv.txt"; then
+                  echo "armbianEnv  : $(sudo sed -n 's/^fdtfile=/fdtfile=/p' "$MNT/armbianEnv.txt" | head -n1)"
+                fi
                 OK=1
-                echo "DTB SHA256 verified: $GOT"
                 break
               fi
-              sudo umount "$d" || true
+              sudo umount "$MNT" || true
             fi
           done
           test "$OK" = 1
 
-          gzip -c -9 work/base.img > work/RK3566-Speaker-Armbian.img.gz
-          sha256sum work/RK3566-Speaker-Armbian.img.gz > work/RK3566-Speaker-Armbian.img.gz.sha256
-          cp firmware/rk3566-speaker.dtb work/rk3566-speaker.dtb
+          # 明确断言：前 16MiB 一个字节都没被我们动过
+          CUR="$(sha256sum work/base-hdr16.img | cut -d' ' -f1)"
+          NOW="$(dd if=work/base.img bs=1M count=16 status=none | sha256sum | cut -d' ' -f1)"
+          test "$CUR" = "$NOW"
+          echo "first 16MiB untouched: $NOW"
 
-      - name: Upload firmware artifact
+          sudo umount -R "$MNT" 2>/dev/null || true
+          sudo losetup -d "$LOOP" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Pack
+        id: pack
+        env:
+          VARIANT: ${{ matrix.variant }}
+          BOARD: ${{ matrix.board }}
+          REL: ${{ inputs.release }}
+          KERN: ${{ matrix.kernel }}
+        run: |
+          set -euo pipefail
+          BASE_NAME="RK3566-Speaker-Armbian_${VARIANT}_${REL}_${KERN}"
+          gzip -c -9 work/base.img > "work/${BASE_NAME}.img.gz"
+          ( cd work && sha256sum "${BASE_NAME}.img.gz" > "${BASE_NAME}.img.gz.sha256" )
+          cp "$DTB_SRC" "work/RK3566-guomeiyun-${VARIANT}.dtb"
+          {
+            echo "variant=$VARIANT"
+            echo "board=$BOARD"
+            echo "base=$(basename "$(cat url.txt)")"
+            echo "target_dtb=$(cat work/target.txt)"
+            echo "dtb_sha256=$(sha256sum "$DTB_SRC" | cut -d' ' -f1)"
+            echo "image_sha256=$(cut -d' ' -f1 "work/${BASE_NAME}.img.gz.sha256")"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "work/${BASE_NAME}.buildinfo.txt"
+          cat "work/${BASE_NAME}.buildinfo.txt"
+          ls -lh work/*.img.gz
+          echo "name=${BASE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RK3566-Speaker-Armbian
+          name: image-${{ matrix.variant }}
           path: |
-            work/RK3566-Speaker-Armbian.img.gz
-            work/RK3566-Speaker-Armbian.img.gz.sha256
-            work/rk3566-speaker.dtb
-            work/base.img.sha256
+            work/*.img.gz
+            work/*.img.gz.sha256
+            work/*.buildinfo.txt
+            work/RK3566-guomeiyun-*.dtb
           compression-level: 0
+          retention-days: 14
+
+  release:
+    name: publish release
+    needs: build
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List
+        run: ls -lh dist
+
+      - name: Compose notes
+        env:
+          REL: ${{ inputs.release }}
+          KERN: ${{ inputs.kernel }}
+          GEN_BOARD: ${{ inputs.generic_board }}
+          GEN_KERN: ${{ inputs.generic_kernel }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## RK3566 触屏音箱 (国美云 / GM260200482) — Armbian \`$REL\`"
+            echo
+            echo "两个镜像的 **DTB 完全相同**（\`firmware/rk3566-guomeiyun.dtb\`，真机验证版）。"
+            echo "区别只在 base 镜像带来的 **loader / uboot / 内核**。"
+            echo
+            echo "| 变体 | base 板型 | 内核 | loader 签名 | 说明 |"
+            echo "|---|---|---|---|---|"
+            echo "| \`wxy-loader\` | \`wxy-oect\` | \`$KERN\` | \`RKSS\` | **这台机器用这个。** 与 eMMC 实际在跑的签名链一致 |"
+            echo "| \`generic\` | \`$GEN_BOARD\` | \`$GEN_KERN\` | 通用版（\`RKNS\`） | 不含 OEC 签名链，用于不希望触发 OTP 的场合 |"
+            echo
+            echo "### 先说清楚 generic 的代价"
+            echo
+            echo "ophub 里 **6.1.x 这条线只有 \`wxy-oect\` 保留**，所有 RK3568/3588 板型都已经迁到 6.18/6.12。"
+            echo "而这块板的驱动全靠 6.1 BSP 派生内核（\`CONFIG_RFKILL_RK\`、\`rockchip,dummy-codec\`、"
+            echo "\`simple-panel-dsi\`、\`wlan-platdata\`）。所以："
+            echo
+            echo "- \`wxy-loader\` → 屏幕 / WiFi / 声卡 / 功放全部可用"
+            echo "- \`generic\` → 能启动，但主线内核没有这些 vendor 驱动，外设大概率不工作"
+            echo
+            echo "generic 的验证目的是 **确认这类 loader 不会碰 OTP**，不是当日常系统用。"
+            echo
+            echo "### 已包含的修复（DTB 层面，两个变体都有）"
+            echo
+            echo "- \`drm-logo\` 保留区归零 → 花屏"
+            echo "- SDIO pinconf \`0xff\`→\`0x130\`、去掉 \`sd-uhs-sdr104\` → WiFi 枚举"
+            echo "- \`#sound-dai-cells\` 补值 → 声卡注册"
+            echo "- 新增 \`spk-amp\`（regulator-fixed, gpio1 RK_PA6）→ 功放常开"
+            echo "- \`gmac1\` 改回 RMII + m0 → RTL8201F 能识别（DMA reset 仍未解）"
+            echo "- 触摸 \`display-coords\` 800×1280"
+            echo
+            echo "### 烧写"
+            echo
+            echo '```'
+            echo "gzip -dc RK3566-Speaker-Armbian_<variant>_*.img.gz \\\\"
+            echo "  | sudo dd of=/dev/mmcblk0 bs=4M status=progress conv=fsync"
+            echo '```'
+            echo
+            echo "整盘写入会覆盖 eMMC 前 16MiB。已锁 OTP 的机器请按自己的安全区流程处理。"
+            echo
+            echo "首次登录 \`root\` / \`1234\`，然后跑仓库里的 \`tools/device-setup.sh\`（补 WiFi 固件软链 + 稳定 MAC）。"
+            echo
+            echo "### 构建元数据"
+            echo
+            echo '```'
+            for f in dist/*.buildinfo.txt; do echo "--- $(basename "$f") ---"; cat "$f"; echo; done
+            echo '```'
+            echo
+            echo "构建日志：$RUN_URL"
+          } > notes.md
+          cat notes.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_IN: ${{ inputs.release_tag }}
+          REL: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG_IN:-}" ]; then TAG="images-$(date -u +%Y%m%d-%H%M)"; else TAG="$TAG_IN"; fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG exists, uploading with --clobber"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "RK3566 Speaker Armbian $REL ($TAG)" \
+              --notes-file notes.md
+          fi
+          echo "### Released as \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --json url -q .url >> "$GITHUB_STEP_SUMMARY" || true

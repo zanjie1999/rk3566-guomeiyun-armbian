@@ -158,8 +158,8 @@ systemctl enable --now fbcon-rotate                # device-setup.sh 会装好
 ```
 dts/rk3566-guomeiyun.dts          实际启动用设备树（ophub DTB 反编译 + 上述补丁）
 dts/reference/rk3566-speaker-vendor.dts   原厂 DTB 反编译（另一块板），留作硬件参考
-firmware/rk3566-speaker.dtb       当前工作 DTB（181917 B）—— CI 用它替换镜像里的 DTB
-firmware/rk3566-guomeiyun.dtb     同一份，易读文件名
+firmware/rk3566-guomeiyun.dtb     当前工作 DTB（181917 B）—— CI 用它替换镜像里的 DTB
+firmware/rk3566-speaker.dtb       同一份，兼容旧文件名
 firmware/rk3566-wxy-oec-turbo-4g.dtb   ophub 原始 DTB（181827 B，未改动，留作基线对照）
 tools/patch-dt.py                 第一轮补丁（spk-amp + display-coords）
 tools/patch-gmac.py               gmac1 RGMII/m1 -> RMII/m0
@@ -171,7 +171,7 @@ tools/find-device.ps1             扫网段 + 试 SSH 自动定位设备 IP（MA
 tools/device-setup.sh             重刷镜像后在设备上跑一次（WiFi 固件软链 / 稳定 MAC / 屏幕旋转 / 功放兜底）
 tools/build-dtb.sh                dts -> dtb
 tools/bin/dtc.exe                 dtc 1.8.1（Windows 本地可编）
-.github/workflows/build.yml       把 firmware/rk3566-speaker.dtb 塞进镜像
+.github/workflows/build.yml       双变体构建 + 自动发 Release（见第四节）
 docs/FLASH.md                     分区表、烧写命令、TTL 验收清单、回滚
 ```
 
@@ -184,7 +184,89 @@ md5sum build/x.dtb firmware/rk3566-guomeiyun.dtb     # 应相同
 
 ---
 
-## 四、重刷镜像后必须做的一步
+## 四、构建镜像（GitHub Actions）
+
+`build.yml` 一次跑出**两个整盘镜像**，DTB 完全相同，区别只在 base 带来的 loader/uboot/内核：
+
+| 变体 | base 板型 | 内核 | `0x8000` 处 | 用途 |
+|---|---|---|---|---|
+| `wxy-loader` | `wxy-oect` | 6.1.157 | **`RKSS`**（17 个 hash） | **这台机器用这个**，与 eMMC 实际在跑的签名链一致 |
+| `generic` | `youyeetoo-yy3568` | 取该板型最新（现为 6.18.59） | **`RKNS`**（1 个 hash） | 通用 loader，不碰 OTP |
+
+`RKSS` / `RKNS` 这两个魔数是实测出来的，位置在偏移 `0x8000`：
+
+```
+RKSS 00 00 00 00 80 01 02 00 11 00 00 00    <- OEC 签名链，带 17 个分区 hash
+RKNS 00 00 00 00 80 01 02 00 01 00 00 00    <- Rockchip 通用，只含自身 hash
+```
+
+两者连 GPT 布局都不一样：`wxy-oect` 的 p1 在 **180 MiB**，`youyeetoo-yy3568` 的 p1 在 **16 MiB**。
+所以绝不能把两者的前 16 MiB 互相套用。
+
+### 触发
+
+仓库 → Actions → **Build Armbian images** → Run workflow：
+
+| 输入 | 默认 | 说明 |
+|---|---|---|
+| `release` | `bookworm` | Armbian 发行版 |
+| `kernel` | `6.1.157` | **wxy-loader 变体**的内核 |
+| `generic_board` | `youyeetoo-yy3568` | generic 变体的板型（必须存在于 ophub releases） |
+| `generic_kernel` | `any` | generic 变体的内核：`any` / `latest-6.1` / 具体版本 |
+| `publish_release` | `true` | 跑完自动建 Release 并上传 |
+| `release_tag` | 空 | 留空 = `images-YYYYMMDD-HHMM` |
+
+### generic 变体的代价（重要）
+
+ophub 里 **6.1.x 这条线只剩 `wxy-oect`**，所有 RK3568/3588 板型都已迁到 6.18/6.12。
+而这块板的驱动全靠 6.1 BSP 派生内核：
+
+```
+CONFIG_RFKILL_RK / rockchip,dummy-codec / simple-panel-dsi / wlan-platdata / rockchip,pdm-mic-array
+```
+
+所以：
+
+- `wxy-loader` → 屏幕、WiFi、声卡、功放、麦克风全部可用
+- `generic` → 能启动，但主线内核没有这些 vendor binding，外设大概率不工作
+
+generic 的用途是**验证这类 loader 不会碰 OTP**，不是当日常系统跑。
+
+### 每个变体做了什么
+
+```
+1. 按板型/发行版/内核从 ophub releases 里挑出 .img.gz（带 token，避开匿名限流）
+2. gunzip（不保留 base.img.gz，省 ~900 MB 磁盘）
+3. losetup --partscan 挂 p1，找 extlinux/extlinux.conf 的 FDT 行
+4. 直接覆盖它指向的那个 .dtb —— 不改配置，避免
+     extlinux:   /dtb/rockchip/x.dtb          (绝对)
+     armbianEnv: rockchip/x.dtb               (相对 /boot/dtb)
+   这两个前缀不一致的坑
+5. 另外放一份 dtb/rockchip/rk3566-guomeiyun.dtb 供人工核对
+6. 回读 sha256 必须等于源文件
+7. 断言前 16 MiB sha256 与改动前一致（证明 loader 一个字节没动）
+8. gzip -9，出 .img.gz + .sha256 + .buildinfo.txt
+9. release job 汇总两个 artifact，gh release create/upload
+```
+
+### 本地复现构建结果
+
+```bash
+# 只验证选片逻辑（不用真下载）
+curl -fsSL 'https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases?per_page=100' -o rel.json
+jq -r --arg b "wxy-oect" --arg r "bookworm" --arg k "6.1.157" '
+  [ .[] | .assets[] | select(.name | test("\\.img\\.gz$")) ]
+  | map(select(.name | test("_rockchip_" + $b + "_" + $r + "_")))
+  | map(select(if $k=="any" then true
+               elif $k=="latest-6.1" then (.name | test("_6\\.1\\.[0-9]+_"))
+               else (.name | test("_" + $k + "_")) end))
+  | sort_by(.name) | last | .browser_download_url
+' rel.json
+```
+
+---
+
+## 五、重刷镜像后必须做的一步
 
 ```bash
 sh tools/device-setup.sh
@@ -215,9 +297,9 @@ aicbsp: fail to set AIC_WIFI power state to 1
 
 ---
 
-## 五、待解
+## 六、待解
 
-### 5.1 有线网口 `Failed to reset the dma`
+### 6.1 有线网口 `Failed to reset the dma`
 
 已确认的部分（都是对的）：
 
@@ -257,7 +339,7 @@ aicbsp: fail to set AIC_WIFI power state to 1
 若插线后仍失败，就只剩两条路：改 `clock_in_out = "output"`（有引脚对打风险），
 或者换回过 BSP 内核（用户实测过 BSP 内核能上网口和触摸）。
 
-### 5.2 触摸 `0x5a` 无应答
+### 6.2 触摸 `0x5a` 无应答
 
 ```
 [HYN]== Hynitron V2.11 20250217 ==
@@ -276,7 +358,7 @@ aicbsp: fail to set AIC_WIFI power state to 1
 
 ---
 
-## 六、风险
+## 七、风险
 
 - 前 16 MiB 一个字节不能碰，刷机只碰 `boot` / `rootfs`，详见 [`docs/FLASH.md`](docs/FLASH.md)。
 - 改 DTB 有回滚路径：设备上留了 `/boot/GOOD.dtb`（原始）、`/boot/GOOD-step0.dtb`、
