@@ -44,7 +44,36 @@ if command -v nmcli >/dev/null 2>&1; then
     echo "[ok] /etc/NetworkManager/conf.d/99-wifi-mac.conf"
 fi
 
-# ----------------------------------------------------------- 4. 功放使能兜底
+# ----------------------------------------------------------- 4. 控制台旋转
+# 面板是 800x1280 竖屏，但横装在机身里，面板原生"上"边朝向机身右侧，
+# 所以画面整体是顺时针转了 90 度。fbcon 需要再反向转 90 度 => rotate=3。
+# 0=不转 1=顺时针90 2=180 3=逆时针90。运行时可直接改：
+#   echo 3 > /sys/class/graphics/fbcon/rotate
+# 这里用 systemd 单次任务持久化，不碰 extlinux.conf / u-boot，零变砖风险。
+FBCON_ROTATE="${FBCON_ROTATE:-3}"
+if [ -w /sys/class/graphics/fbcon/rotate ]; then
+    echo "$FBCON_ROTATE" > /sys/class/graphics/fbcon/rotate || true
+    cat > /etc/systemd/system/fbcon-rotate.service <<EOF
+[Unit]
+Description=Rotate framebuffer console (portrait panel mounted landscape)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo $FBCON_ROTATE > /sys/class/graphics/fbcon/rotate'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable fbcon-rotate >/dev/null 2>&1 || true
+    echo "[ok] fbcon rotate=$FBCON_ROTATE (当前: $(cat /sys/class/graphics/fbcon/rotate))"
+else
+    echo "[!!] /sys/class/graphics/fbcon/rotate 不可写，跳过旋转"
+fi
+
+# ----------------------------------------------------------- 5. 功放使能兜底
 # 正常情况下由 DTB 里的 spk-amp（regulator-fixed, gpio1 RK_PA6 = gpio-38）拉高。
 # 若换用了不含该节点的 DTB，用这条兜底。
 if ! grep -q 'spk-amp' /sys/kernel/debug/gpio 2>/dev/null; then

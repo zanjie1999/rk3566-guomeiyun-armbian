@@ -8,6 +8,7 @@
 | 功能 | 状态 | 关键点 |
 |---|---|---|
 | 启动 / 显示 | ✅ | `drm-logo` 保留区归零 |
+| 屏幕方向 | ✅ | 面板竖装横置，控制台 `fbcon=rotate:3` |
 | 扬声器 | ✅ | DTB 里 `spk-amp`（regulator-fixed）拉高 gpio-38 |
 | 麦克风 | ✅ | PDM 阵列，card0 同时提供 `pcmC0D0c` / `pcmC0D0p` |
 | WiFi | ✅ | AIC8800；需补一个固件软链（见第四节） |
@@ -129,6 +130,27 @@ display-coords = <0x00 0x00 0x438 0x780>  ->  <0x00 0x00 0x320 0x500>
 
 改完 `[HYN]dts x_res = 800,y_res = 1280`。但 IC 仍不应答，见第五节。
 
+### 2.6 屏幕方向：竖屏面板横装
+
+面板原生是 **800×1280 竖屏**，但横着装进机身里，**面板原生的"上"边朝机身右侧**。
+所以直接输出时画面整体顺时针转了 90°，即"文字的上方在屏幕右侧、下方在左侧"。
+
+要补回来就得反向转 90°，对应 `fbcon=rotate:3`（0=不转 1=顺时针90 2=180 3=逆时针90）。
+
+面板节点里**没有** `rotation` 属性，且 `simple-panel-dsi` 不是主线驱动，所以不从 DT 走。
+也不用改 `extlinux.conf` 的 `APPEND`（那条改错就开不了机），改成 systemd 单次任务，
+**零启动链风险**：
+
+```bash
+echo 3 > /sys/class/graphics/fbcon/rotate          # 立刻生效，可现场试 0/1/2/3
+systemctl enable --now fbcon-rotate                # device-setup.sh 会装好
+```
+
+内核需 `CONFIG_FRAMEBUFFER_CONSOLE_ROTATION=y` —— 这台机器是 `=y`。
+
+> 触摸修正要跟着这个方向走：`pos-swap` / `reversex` / `reversey` 的组合要和
+> `rotate:3` 一致，否则触摸方向会和画面错 90°。等 IC 能通信之后再一起调。
+
 ---
 
 ## 三、仓库结构
@@ -142,10 +164,11 @@ firmware/rk3566-wxy-oec-turbo-4g.dtb   ophub 原始 DTB（181827 B，未改动�
 tools/patch-dt.py                 第一轮补丁（spk-amp + display-coords）
 tools/patch-gmac.py               gmac1 RGMII/m1 -> RMII/m0
 tools/phmap.py                    phandle -> 节点名 映射（跨两份 DTS 翻译用）
-tools/mmio.py                     /dev/mem 读 32 位寄存器（诊断时钟/复位用）
+tools/mmio.py                     /dev/mem 读写 32 位寄存器（诊断时钟/复位用）
 tools/wavstat.py                  量录音电平，判断麦克风是不是静音
 tools/rsh.ps1                     本机 → 设备的 SSH 封装（免密码）
-tools/device-setup.sh             重刷镜像后在设备上跑一次（WiFi 固件软链等）
+tools/find-device.ps1             扫网段 + 试 SSH 自动定位设备 IP（MAC 变了也不怕）
+tools/device-setup.sh             重刷镜像后在设备上跑一次（WiFi 固件软链 / 稳定 MAC / 屏幕旋转 / 功放兜底）
 tools/build-dtb.sh                dts -> dtb
 tools/bin/dtc.exe                 dtc 1.8.1（Windows 本地可编）
 .github/workflows/build.yml       把 firmware/rk3566-speaker.dtb 塞进镜像
@@ -211,24 +234,28 @@ aicbsp: fail to set AIC_WIFI power state to 1
 失败的落点：
 
 ```
-0xfe011000 (DMA_Mode) = 0x00000001     ← SWR 位卡在 1，软复位永不完成
-clk_gmac1              = 50 MHz
-clk_gmac1_rmii_speed   = 2.5 MHz
-clk_gmac1_rx_tx        = 2.5 MHz       ← MAC 收发时钟
+0xfe011000 (DMA_Bus_Mode) = 0x00000001   ← SWR 位卡在 1，软复位永不完成
+0xfe010110 (MAC_Version)  = 0x00003051   ← MAC 本体活着（Synopsys ID 0x51）
 ```
 
-`clock_in_out = "input"` 时，驱动不自己产生时钟，**`clk_gmac1` 完全依赖 PHY 从
-`gmac1m0-clkinout` 引脚送进来的 50 MHz REF_CLK**。SWR 卡死 + MDIO 正常
-（MDIO 走 `pclk_mac`，与 REF_CLK 无关）这两个现象同时出现，最可能是**这条 REF_CLK 实际没到**。
+**已排除的假设：**
 
-两条待选路线（都要动 DT，重启一次）：
+| 假设 | 怎么验的 | 结果 |
+|---|---|---|
+| 缺 RMII 的 50 MHz REF_CLK | 删掉 `assigned-clock-parents`，让 `clk_gmac1` 从内部 PLL 出 125 MHz | ❌ 依然 `Failed to reset the dma` |
+| SDR104/tuning 之类 SDIO 问题 | — | 无关，那是 WiFi |
+| 引脚被抢 / 模式没切 | pinmux + GRF `0xfdc6038c=0x40` | 都对 |
+| MAC 被按在复位里 | 读 `MAC_Version`，值正常 | 不在复位 |
+| 手工清 SWR 绕过 | `/dev/mem` 写映射 | ❌ 内核策略拒绝（`PermissionError`） |
 
-- **A. `clock_in_out = "output"`** —— 让 SoC 自己产生 50 MHz 送给 PHY。
-  副作用风险：如果 PHY 本来就在驱动这条线，会变成两个输出对打（引脚争用）。
-- **B. 保持 input，把 `assigned-clock-parents` 改成内部 PLL 供时钟** ——
-  纯诊断手段，可确认"是不是没时钟"，但时钟源与 PHY 不同步，链路仍可能不通。
+**结论**：MAC 活着、时钟在跑、模式正确、PHY 认得，唯独 **DMA 块不肯完成软复位**。
+这跟 PHY 模式无关（最初 RGMII 配置也是同一个报错），是这块板子上独立的问题。
 
-要动手前请确认：**网线插上后网口灯亮不亮？** 灯亮说明 PHY 侧链路和它自己的时钟是活的。
+**下一步（需要插网线）**：先插网线再 `ip link set eth0 up` 试一次。
+没插线时 PHY 处于低功耗态，某些设计下 `mac_clk_rx` 不跑，
+而 `dwmac4_dma_reset` 有可能依赖它 —— 这是目前最省事、最可能翻盘的验证。
+若插线后仍失败，就只剩两条路：改 `clock_in_out = "output"`（有引脚对打风险），
+或者换回过 BSP 内核（用户实测过 BSP 内核能上网口和触摸）。
 
 ### 5.2 触摸 `0x5a` 无应答
 
