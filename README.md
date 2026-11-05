@@ -442,11 +442,30 @@ hyn_ts: probe of 1-005a failed with error -2
 | regulator 重新初始化 | `unbind` + `bind` 一次（制造电平边沿）后仍为 `out hi` |
 | DTB 里的 5V 开关数量 | 只有 `vcc5v0_otg`(pin22)、`vcc5v0_host`(pin6)、`vcc5v0_usb`（无 gpio，中间轨）三路，**没有第三路可控开关** |
 
-也就是说：软件侧能开的都开了、引脚映射也和原厂一致，仍然没有输出。
-剩下的怀疑对象是那个口的座子 / 限流开关管（这机器触摸排线都断了，硬件状况本来就差）。
+补充一组决定性实测（逐个用 sysfs 拉 GPIO 电平，同时用万用表量两个口）：
 
-**机主用万用表实测：VBUS 对地 0 V。** 结合上面已经排除的软件因素，判定为硬件问题，
-不再在 DTB 上继续尝试。
+| `gpio0-6` | `gpio0-22` | USB 2.0 口 | USB 3.0 口 |
+|---|---|---|---|
+| hi | hi | 5 V | 0 V |
+| lo | hi | 5 V | 0 V |
+| hi | lo | **0 V** | 0 V |
+
+结论：
+
+- **USB 2.0 口由 `vcc5v0_otg`（gpio0-22）供电**，高有效，已实测有效。
+- **USB 3.0 口不受 gpio0-6 控制** —— 该脚在高、低两种电平下，这个口都没有电压输出。
+
+`regulator_summary` 里 `vcc5v0_host` 是 `enabled`、`users=4`、`always-on`；
+pin 6 的 mux 与正常工作的 pin 22 完全一致（`function usb group vcc5v0-host-en`）；
+和 Android 原厂 DTB 逐字段对比也一致 —— 原厂只有 `vcc5v0_host`(gpio0-6) /
+`vcc5v0_otg`(gpio0-22) 两路，**没有第三路**；Linux 侧多出的 `vcc5v0_usb`
+只是没有 gpio 的中间描述轨，不控制任何开关。
+
+**软件侧能开的都开了、引脚映射也和原厂一致，仍然没有输出。**
+**机主用万用表实测：这个口的 VBUS 对地 0 V。** 结合已经排除的软件因素，判定为硬件问题，
+不再在 DTB 上继续尝试（补充：机主回忆这个口在 Android 下可以用，但 Android 的 DTB
+里供电定义与 Linux 完全相同，所以要么当时用的是另一个口，要么差异在 U-Boot/PMIC
+阶段的初始化，两者都不是改 DTB 能补的）。
 
 **进一步验证数据线**：从外部单独给该口的 VBUS 加 5 V 再插 USB 设备，系统**依然零枚举**。
 为排除控制器状态卡死，又对 `fd000000.usb` 做了一次 `unbind` + `bind`（xhci 完整重建，

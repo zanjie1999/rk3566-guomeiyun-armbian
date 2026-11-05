@@ -7655,9 +7655,10 @@
 
 	vcc5v0_otg: vcc5v0-otg-regulator {
 		compatible = "regulator-fixed";
-		/* 2026-11-05: without these two the regulator is never enabled
-		 * (no consumer asks for it), so gpio0-5 stays low and the
-		 * USB3 port has no VBUS at all. */
+		/* 2026-11-06: measured. This rail feeds the A socket on
+		 * fcc00000.usb (the working USB 2.0 port), not the USB 3 one.
+		 * Without boot-on/always-on nothing ever asks for it, so
+		 * gpio0-22 (GPIO0_C6) stays low and that socket has no VBUS. */
 		regulator-boot-on;
 		regulator-always-on;
 		regulator-name = "vcc5v0_otg";
