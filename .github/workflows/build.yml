@@ -65,8 +65,31 @@ env:
   DTB_SUBDIR: dtb/rockchip
 
 jobs:
+  # 两个 matrix job 必须用同一个 tag，所以在这里算一次
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: t
+        env:
+          TAG_IN: ${{ inputs.release_tag }}
+          REL: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TAG_IN:-}" ]; then
+            TAG="$TAG_IN"
+          else
+            TAG="images-${REL}-r${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG"
+
   build:
     name: build / ${{ matrix.variant }}
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -326,40 +349,12 @@ jobs:
           ls -lh work/*.img.gz
           echo "name=${BASE_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-${{ matrix.variant }}
-          path: |
-            work/*.img.gz
-            work/*.img.gz.sha256
-            work/*.buildinfo.txt
-            work/RK3566-guomeiyun-*.dtb
-          compression-level: 0
-          retention-days: 14
-
-  release:
-    name: publish release
-    needs: build
-    if: ${{ inputs.publish_release }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: List
-        run: ls -lh dist
-
-      - name: Compose notes
+      - name: Compose release notes
         env:
           REL: ${{ inputs.release }}
-          KERN: ${{ inputs.kernel }}
+          KERN: ${{ matrix.kernel }}
+          BOARD: ${{ matrix.board }}
+          VARIANT: ${{ matrix.variant }}
           GEN_BOARD: ${{ inputs.generic_board }}
           GEN_KERN: ${{ inputs.generic_kernel }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -373,12 +368,12 @@ jobs:
             echo
             echo "| 变体 | base 板型 | 内核 | loader 签名 | 说明 |"
             echo "|---|---|---|---|---|"
-            echo "| \`wxy-loader\` | \`wxy-oect\` | \`$KERN\` | \`RKSS\` | **这台机器用这个。** 与 eMMC 实际在跑的签名链一致 |"
+            echo "| \`wxy-loader\` | \`wxy-oect\` | \`${{ inputs.kernel }}\` | \`RKSS\` | **这台机器用这个。** 与 eMMC 实际在跑的签名链一致 |"
             echo "| \`generic\` | \`$GEN_BOARD\` | \`$GEN_KERN\` | 通用版（\`RKNS\`） | 不含 OEC 签名链，用于不希望触发 OTP 的场合 |"
             echo
             echo "### 先说清楚 generic 的代价"
             echo
-            echo "ophub 里 **6.1.x 这条线只有 \`wxy-oect\` 保留**，所有 RK3568/3588 板型都已经迁到 6.18/6.12。"
+            echo "ophub 里 **6.1.x 这条线只剩 \`wxy-oect\`**，所有 RK3568/3588 板型都已迁到 6.18/6.12。"
             echo "而这块板的驱动全靠 6.1 BSP 派生内核（\`CONFIG_RFKILL_RK\`、\`rockchip,dummy-codec\`、"
             echo "\`simple-panel-dsi\`、\`wlan-platdata\`）。所以："
             echo
@@ -399,40 +394,68 @@ jobs:
             echo "### 烧写"
             echo
             echo '```'
-            echo "gzip -dc RK3566-Speaker-Armbian_<variant>_*.img.gz \\\\"
-            echo "  | sudo dd of=/dev/mmcblk0 bs=4M status=progress conv=fsync"
+            echo "gzip -dc RK3566-Speaker-Armbian_<variant>_*.img.gz | sudo dd of=/dev/mmcblk0 bs=4M status=progress conv=fsync"
             echo '```'
             echo
-            echo "整盘写入会覆盖 eMMC 前 16MiB。已锁 OTP 的机器请按自己的安全区流程处理。"
+            echo "整盘写入会覆盖 eMMC 前 16MiB。**\`wxy-loader\` 变体的前 16MiB 与本机实测一致，"
+            echo "刷完不需要补刷安全区**；generic 变体不要刷到已锁的机器上。"
             echo
             echo "首次登录 \`root\` / \`1234\`，然后跑仓库里的 \`tools/device-setup.sh\`（补 WiFi 固件软链 + 稳定 MAC）。"
             echo
             echo "### 构建元数据"
             echo
             echo '```'
-            for f in dist/*.buildinfo.txt; do echo "--- $(basename "$f") ---"; cat "$f"; echo; done
+            for f in work/*.buildinfo.txt; do echo "--- $(basename "$f") ---"; cat "$f"; echo; done
             echo '```'
             echo
             echo "构建日志：$RUN_URL"
-          } > notes.md
-          cat notes.md
+          } > work/notes.md
+          cat work/notes.md
 
-      - name: Create or update release
+      # 不发 Release 时才留 artifact —— 900MB×2 在私有仓库会直接爆 artifact 配额
+      - name: Upload artifact
+        if: ${{ !inputs.publish_release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.variant }}
+          path: |
+            work/*.img.gz
+            work/*.img.gz.sha256
+            work/*.buildinfo.txt
+            work/RK3566-guomeiyun-*.dtb
+          compression-level: 0
+          retention-days: 3
+
+      - name: Publish to release
+        if: ${{ inputs.publish_release }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_IN: ${{ inputs.release_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VARIANT: ${{ matrix.variant }}
           REL: ${{ inputs.release }}
         run: |
           set -euo pipefail
-          if [ -z "${TAG_IN:-}" ]; then TAG="images-$(date -u +%Y%m%d-%H%M)"; else TAG="$TAG_IN"; fi
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "release $TAG exists, uploading with --clobber"
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* \
-              --title "RK3566 Speaker Armbian $REL ($TAG)" \
-              --notes-file notes.md
+          ls -lh work/*.img.gz
+
+          # 两个 matrix job 并发跑，release 只能建一次：
+          # 先到者 create，后到者 view 成功直接 upload；真撞上了就重试 upload。
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            if ! gh release create "$TAG" \
+                  --title "RK3566 Speaker Armbian $REL ($TAG)" \
+                  --notes-file work/notes.md; then
+              echo "::warning::release create raced, falling back to upload"
+              sleep 10
+            fi
           fi
-          echo "### Released as \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          gh release view "$TAG" --json url -q .url >> "$GITHUB_STEP_SUMMARY" || true
+
+          gh release upload "$TAG" \
+            work/*.img.gz \
+            work/*.img.gz.sha256 \
+            work/*.buildinfo.txt \
+            work/RK3566-guomeiyun-*.dtb \
+            --clobber
+
+          {
+            echo "### $VARIANT published to \`$TAG\`"
+            gh release view "$TAG" --json url -q .url || true
+          } >> "$GITHUB_STEP_SUMMARY"

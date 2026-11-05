@@ -246,8 +246,11 @@ generic 的用途是**验证这类 loader 不会碰 OTP**，不是当日常系�
 6. 回读 sha256 必须等于源文件
 7. 断言前 16 MiB sha256 与改动前一致（证明 loader 一个字节没动）
 8. gzip -9，出 .img.gz + .sha256 + .buildinfo.txt
-9. release job 汇总两个 artifact，gh release create/upload
+9. 构建完**直接** `gh release create/upload` —— 不走 artifact，
+   因为 900 MB × 2 会把私有仓库的 artifact 配额撑爆；两个 matrix job 抢建 release 有重试
 ```
+
+`publish_release=false` 时才退回 artifact（retention 3 天），用于只构建不发版。
 
 ### 本地复现构建结果
 
