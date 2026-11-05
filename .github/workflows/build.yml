@@ -10,8 +10,13 @@ name: Build Armbian images
 #                loader/uboot 不含 OEC 厂商的东西，用于不会触发 OTP 的场合。
 #
 # 两条铁律（写死在脚本里）：
-#   1. 绝不写镜像 0 .. 180MiB 这段。p1 从 180MiB 起，只挂 p1 改其中的 DTB。
-#   2. DTB 只换内容不换路径，extlinux.conf / armbianEnv.txt 同步指向同一个文件名。
+#   1. 只挂 p1 改里面的 DTB。改完重新 dd 前 16MiB 算 sha256，必须与改动前一致，
+#      否则构建直接失败 —— 这条断言比任何注释都管用。
+#   2. DTB 只换内容不换路径，直接覆盖 extlinux.conf 的 FDT 指向的那个文件。
+#      不改编排配置，因为：
+#        extlinux.conf  FDT /dtb/rockchip/x.dtb        绝对路径
+#        armbianEnv.txt fdtfile=rockchip/x.dtb         相对 /boot/dtb
+#      两边前缀不一样，改配置就得同时改两处、各有规则，容易出错。
 
 on:
   workflow_dispatch:
@@ -50,7 +55,7 @@ on:
         default: true
         type: boolean
       release_tag:
-        description: "Release tag（留空 = 自动 images-YYYYMMDD-HHMM）"
+        description: "Release tag（留空 = 自动 images-<release>-r<run_number>）"
         required: false
         default: ""
         type: string
