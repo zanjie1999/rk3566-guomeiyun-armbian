@@ -214,7 +214,7 @@ RKNS 00 00 00 00 80 01 02 00 01 00 00 00    <- Rockchip 通用，只含自身 ha
 | `generic_board` | `youyeetoo-yy3568` | generic 变体的板型（必须存在于 ophub releases） |
 | `generic_kernel` | `any` | generic 变体的内核：`any` / `latest-6.1` / 具体版本 |
 | `publish_release` | `true` | 跑完自动建 Release 并上传 |
-| `release_tag` | 空 | 留空 = `images-YYYYMMDD-HHMM` |
+| `release_tag` | 空 | 留空 = `images-<release>-r<run_number>` |
 
 ### generic 变体的代价（重要）
 
