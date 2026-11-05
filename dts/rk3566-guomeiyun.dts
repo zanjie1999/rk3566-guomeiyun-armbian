@@ -979,7 +979,13 @@
 			compatible = "snps,dwc3";
 			reg = <0x00 0xfcc00000 0x00 0x400000>;
 			interrupts = <0x00 0xa9 0x04>;
-			dr_mode = "otg";
+			/* 2026-11-05: was "otg". With otg the port sits in device
+			 * mode (extcon0 reports USB=1) unless a cable with a grounded
+			 * ID pin is used, so a normal U-disk / keyboard is never seen.
+			 * "host" makes it usable as a plain USB-A port. Set back to
+			 * "otg" if you need the port as a gadget (RNDIS/serial).
+			 */
+			dr_mode = "host";
 			phy_type = "utmi_wide";
 			power-domains = <0x29 0x0f>;
 			resets = <0x27 0x94>;
@@ -1312,6 +1318,21 @@
 		pinctrl-names = "default";
 		#address-cells = <0x01>;
 		#size-cells = <0x00>;
+		/* 2026-11-05: MUST stay disabled on this board.
+		 *
+		 * i2c0 uses GPIO0_A1/A2 (pin 9/10) as SDA/SCL, but GPIO0_A1 is
+		 * also the WiFi power-enable line:
+		 *     sdio_pwrseq { wifi_wl-gpios = <&gpio0 9 0>; }
+		 * Enabling i2c0 turns that pin into an I2C signal, aicbsp then
+		 * fails with "fail to set AIC_WIFI power state to 1" and wlan0
+		 * never appears. Verified the hard way: enabling i2c0 + rk809
+		 * killed WiFi entirely.
+		 *
+		 * Consequence: RK809 never probes -> no vdd_gpu / vdd_logic
+		 * regulators -> panfrost stays deferred with
+		 * "_opp_set_regulators: no regulator (mali) found".
+		 * So there is no GPU acceleration path via the PMIC here.
+		 */
 		status = "disabled";
 		phandle = <0x17f>;
 
@@ -1362,6 +1383,10 @@
 			vcc8-supply = <0x41>;
 			vcc9-supply = <0x41>;
 			phandle = <0x14d>;
+			/* 2026-11-05: stays disabled, see the i2c0 note above.
+			 * tcs4525@1c is disabled as well (CPU rail left at the
+			 * bootloader/PMIC default, which works fine).
+			 */
 			status = "disabled";
 
 			pwrkey {
@@ -7327,7 +7352,11 @@
 			};
 
 			vcc5v0_otg_en: vcc5v0-otg-en {
-				rockchip,pins = <0x00 0x05 0x00 0x130>;
+				/* 2026-11-05: pin 22 = GPIO0_C6, matching the vendor
+				 * DTB. ophub used pin 5 here, which is not wired to
+				 * any VBUS switch on this board.
+				 */
+				rockchip,pins = <0x00 0x16 0x00 0x130>;
 				phandle = <0x14c>;
 			};
 		};
@@ -7486,8 +7515,19 @@
 		compatible = "gpio-leds";
 		phandle = <0x320>;
 
+		/* 2026-11-05: pins taken from the vendor DTB. ophub had a single
+		 * work_led on gpio0-15 (pin 15), which drives nothing on this
+		 * board -- measured: toggling it lights no LED at all.
+		 * gpio0-10 (pin 10) = red, gpio0-19 (pin 19) = blue (sys).
+		 */
+		power_led: power {
+			gpios = <0x3d 0x0a 0x00>;
+			default-state = "on";
+			linux,default-trigger = "default-on";
+		};
+
 		work_led: work {
-			gpios = <0x3d 0x0f 0x00>;
+			gpios = <0x3d 0x13 0x00>;
 			linux,default-trigger = "heartbeat";
 			phandle = <0x321>;
 		};
@@ -7615,11 +7655,17 @@
 
 	vcc5v0_otg: vcc5v0-otg-regulator {
 		compatible = "regulator-fixed";
+		/* 2026-11-05: without these two the regulator is never enabled
+		 * (no consumer asks for it), so gpio0-5 stays low and the
+		 * USB3 port has no VBUS at all. */
+		regulator-boot-on;
+		regulator-always-on;
 		regulator-name = "vcc5v0_otg";
 		regulator-min-microvolt = <0x4c4b40>;
 		regulator-max-microvolt = <0x4c4b40>;
 		enable-active-high;
-		gpio = <0x3d 0x05 0x00>;
+		/* 2026-11-05: pin 22 = GPIO0_C6 (vendor DTB). Was pin 5. */
+		gpio = <0x3d 0x16 0x00>;
 		vin-supply = <0x14a>;
 		pinctrl-names = "default";
 		pinctrl-0 = <0x14c>;

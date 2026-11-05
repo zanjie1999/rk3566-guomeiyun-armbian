@@ -3,7 +3,9 @@
 目标机：RK3566 / 4GB / 800×1280 MIPI-DSI 触摸屏 / eMMC / AIC8800 SDIO WiFi / RTL8201F 百兆网口
 序列号：GM260200482
 
-**当前状态：能正常启动，屏幕、扬声器、麦克风、WiFi 全部可用。触摸、有线网口待解。**
+**当前状态：能正常启动，屏幕、扬声器、麦克风、WiFi、电源灯/系统灯、USB 2.0 口全部可用。
+触摸的驱动、坐标、DTB 均已就绪，但测试机触摸芯片到屏幕的排线断了，无法实测；
+有线网口与 USB 3.0 口的 5V 待解。**
 
 | 功能 | 状态 | 关键点 |
 |---|---|---|
@@ -12,7 +14,10 @@
 | 扬声器 | ✅ | DTB 里 `spk-amp`（regulator-fixed）拉高 gpio-38 |
 | 麦克风 | ✅ | PDM 阵列，card0 同时提供 `pcmC0D0c` / `pcmC0D0p` |
 | WiFi | ✅ | AIC8800；需补一个固件软链（见第四节） |
-| 触摸 | ⚠️ | I2C 0x5a 无 ACK，`cst3240_enter_boot failed` |
+| 电源灯 / 系统灯 | ✅ | gpio0-10 红灯常亮、gpio0-19 蓝灯 heartbeat（见 2.7） |
+| USB 2.0（OTG 口） | ✅ | `dr_mode = "host"` + `vcc5v0_otg` 常开（见 2.8） |
+| USB 3.0 口供电 | ⚠️ | `fd000000.usb` 控制器正常，VBUS 无输出（见 6.3） |
+| 触摸 | ⚠️ | 驱动/坐标/DTB 已就绪，测试机排线断裂，无法验证（见 6.2） |
 | 有线网口 | ⚠️ | PHY 已识别（RTL8201F），`Failed to reset the dma` |
 
 ---
@@ -128,7 +133,8 @@ spk-amp {
 display-coords = <0x00 0x00 0x438 0x780>  ->  <0x00 0x00 0x320 0x500>
 ```
 
-改完 `[HYN]dts x_res = 800,y_res = 1280`。但 IC 仍不应答，见第五节。
+改完 `[HYN]dts x_res = 800,y_res = 1280`。至于 IC 本身正不正常，这台测试机上验证不了 ——
+触摸芯片到屏幕的排线断了，详见 6.2。
 
 ### 2.6 屏幕方向：竖屏面板横装
 
@@ -149,7 +155,59 @@ systemctl enable --now fbcon-rotate                # device-setup.sh 会装好
 内核需 `CONFIG_FRAMEBUFFER_CONSOLE_ROTATION=y` —— 这台机器是 `=y`。
 
 > 触摸修正要跟着这个方向走：`pos-swap` / `reversex` / `reversey` 的组合要和
-> `rotate:3` 一致，否则触摸方向会和画面错 90°。等 IC 能通信之后再一起调。
+> `rotate:3` 一致，否则触摸方向会和画面错 90°。换到排线完好的机器上再一起调。
+
+### 2.7 两个指示灯：引脚全写错了
+
+ophub 的 DTB 只有一个 `work_led`，挂在 **gpio0-15**（pin 15）。实测把这个脚在 0/1 之间
+来回切，**两颗灯都不亮** —— 那个脚在这块板上什么都没接。
+
+原厂 DTB 里是两颗灯，引脚完全不同：
+
+| 灯 | 原厂引脚 | 现 DTB | 触发器 |
+|---|---|---|---|
+| 红灯（电源） | GPIO0_B2 = gpio0-**10** | `power_led` | `default-on` 常亮 |
+| 蓝灯（sys） | GPIO0_C3 = gpio0-**19** | `work_led` | `heartbeat` |
+
+验证方式（运行时，不用重启）：
+
+```bash
+echo 19 > /sys/class/gpio/export; echo out > /sys/class/gpio/gpio19/direction
+echo 1  > /sys/class/gpio/gpio19/value      # 蓝灯亮
+echo 1  > /sys/class/gpio/gpio10/value      # 红灯亮；echo 0 即灭
+```
+
+> 蓝灯用 `heartbeat`，系统空闲时几乎常亮、负载高时快闪，这是正常的。
+> 想让它固定节奏闪，把 `linux,default-trigger` 换成 `timer` 即可。
+
+### 2.8 USB 2.0 口（原 OTG 口）
+
+两个问题叠在一起：
+
+1. **VBUS 使能脚错位** —— ophub 把 `vcc5v0_otg` 的 gpio 写成 `pin 5`，原厂是
+   **GPIO0_C6 = pin 22**。拉错脚当然没反应，那个口一点电都没有。
+2. **`dr_mode = "otg"`** —— 没插带接地 ID 脚的线时，这个口一直待在 device 模式
+   （`extcon0: USB=1`），插 U 盘、手柄永远不会枚举。
+
+改了两处：
+
+```
+vcc5v0-otg-regulator: gpio = <&gpio0 22 0> + regulator-boot-on + regulator-always-on
+usbdrd_dwc3:          dr_mode = "host"
+```
+
+结果：
+
+```
+gpio-22 (vcc5v0-otg-regulator) out hi
+extcon0: USB-HOST=1
+lsusb: 8 个 root hub（多了 xhci-hcd.1.auto，Bus 7/8）
+usb 5-1: New USB device found, idVendor=067b ... USB SD Card Reader   ← 实测枚举成功
+```
+
+> `regulator-always-on` 会让这个口**一直输出 5V**（原厂是等 OTG 检测才给电）。
+> 如果以后要把它当 gadget 用（RNDIS / 串口），把 `dr_mode` 改回 `otg`，
+> 并去掉这个 regulator 的 `always-on`。
 
 ---
 
@@ -158,7 +216,7 @@ systemctl enable --now fbcon-rotate                # device-setup.sh 会装好
 ```
 dts/rk3566-guomeiyun.dts          实际启动用设备树（ophub DTB 反编译 + 上述补丁）
 dts/reference/rk3566-speaker-vendor.dts   原厂 DTB 反编译（另一块板），留作硬件参考
-firmware/rk3566-guomeiyun.dtb     当前工作 DTB（181917 B）—— CI 用它替换镜像里的 DTB
+firmware/rk3566-guomeiyun.dtb     当前工作 DTB（182039 B）—— CI 用它替换镜像里的 DTB
 firmware/rk3566-speaker.dtb       同一份，兼容旧文件名
 firmware/rk3566-wxy-oec-turbo-4g.dtb   ophub 原始 DTB（181827 B，未改动，留作基线对照）
 tools/patch-dt.py                 第一轮补丁（spk-amp + display-coords）
@@ -340,24 +398,55 @@ aicbsp: fail to set AIC_WIFI power state to 1
 没插线时 PHY 处于低功耗态，某些设计下 `mac_clk_rx` 不跑，
 而 `dwmac4_dma_reset` 有可能依赖它 —— 这是目前最省事、最可能翻盘的验证。
 若插线后仍失败，就只剩两条路：改 `clock_in_out = "output"`（有引脚对打风险），
-或者换回过 BSP 内核（用户实测过 BSP 内核能上网口和触摸）。
+或者换回过 BSP 内核（机主实测 BSP 内核上网口是通的）。
 
-### 6.2 触摸 `0x5a` 无应答
+### 6.2 触摸：测试机排线断裂，无法验证
+
+**这不是软件问题。** 这台测试机的触摸芯片到屏幕之间排线断了，属硬件损坏，换排线才能修。
+
+软件侧该做的都做完了：
+
+- 驱动 `hyn,3240` 正常加载
+- `display-coords` 从 `1080×1920` 修正为 `800×1280`
+- `power-supply` 指向 `vcc3v3_lcd0_n`，该 regulator 注册成功
+- 复位脚 `gpio0-14`、中断脚 `gpio0-13` 定义正确
+
+断线状态下看到下面这些报错是必然结果，不要当成 bug 去查：
 
 ```
 [HYN]== Hynitron V2.11 20250217 ==
-[HYN]vdd_ana not config
-[HYN]vdd_i2c not config
+[HYN]dts x_res = 800,y_res = 1280,touch-number = 5 swap_xy = 0 reversex = 0 reversey = 0
 [HYN]cst3240_enter_boot failed
 [HYN][Error]hyn_ts_probe:hyn_check_ic failed
+hyn_ts: probe of 1-005a failed with error -2
 ```
 
-- 坐标已经修好（`x_res = 800, y_res = 1280`），只剩 IC 不应答。
-- `i2cdetect -y -r 1` 上只有 **0x51** 有应答，0x5a / 0x14 全 `--`。
-- probe 失败后 `reset-gpios`（gpio0-14）/ `irq-gpios`（gpio0-13）已被释放，
-  `/sys/kernel/debug/gpio` 里看不到，无法据此判断复位态。
-- 下一步方向：确认触摸供电（`power-supply` 缺失，两路 vdd 都 `not config`）、
-  复位极性是否该是 `ACTIVE_LOW`、以及 0x51 那个应答到底是不是触摸 IC 换了地址。
+`error -2` = `ENOENT`，就是 I2C 上问不到 `0x5a`。`i2cdetect -y -r 1` 只有 **0x51** 有应答，
+那是同一条总线上的另一颗器件，不是触摸 IC 换了地址。
+
+**结论：应该能用，只是这台测试机测不了。** 换成排线完好的机器后，如果触按方向不对，
+按 2.6 的 `rotate:3` 去调 `pos-swap` / `posx-reverse` / `posy-reverse`。
+
+### 6.3 USB 3.0 口的 5V
+
+控制器本身是好的，`fd000000.usb`（`xhci-hcd.1.auto`）正常挂出 Bus 7（480M）和 Bus 8（5000M），
+`Host supports USB 3.0 SuperSpeed`。问题只在那一路 **VBUS 没有电压**，插什么都没反应。
+
+已经做过的检查：
+
+| 检查 | 结果 |
+|---|---|
+| `vcc5v0_host` gpio | `gpio0-6`，与**原厂 DTB 完全一致**（不是猜的） |
+| pin 6 复用 | `pinmux-pins`: `vcc5v0-host-regulator gpio0:6 function usb group vcc5v0-host-en`，纯 GPIO 输出，没被别的功能占 |
+| 电平 | `gpio-6 ... out hi` |
+| regulator 重新初始化 | `unbind` + `bind` 一次（制造电平边沿）后仍为 `out hi` |
+| DTB 里的 5V 开关数量 | 只有 `vcc5v0_otg`(pin22)、`vcc5v0_host`(pin6)、`vcc5v0_usb`（无 gpio，中间轨）三路，**没有第三路可控开关** |
+
+也就是说：软件侧能开的都开了、引脚映射也和原厂一致，仍然没有输出。
+剩下的怀疑对象是那个口的座子 / 限流开关管（这机器触摸排线都断了，硬件状况本来就差）。
+
+**待确认**：那个口是标准 USB-A 还是别的形态；插一个带灯的设备，看灯亮不亮，
+同时看 `dmesg` 里 Bus 7/8 有没有 `new SuperSpeed USB device` 之类的枚举记录。
 
 ---
 
