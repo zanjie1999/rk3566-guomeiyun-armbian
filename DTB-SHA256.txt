@@ -1,1 +1,2 @@
-d38a9382415b6b65d93f3e841ebfd5d02cc50ccc1e6495cb72d6b45a275155ac  firmware/rk3566-speaker.dtb
+503b5fa1372f97c687702c65d8198cf085277a02bbcf053c0cc2b3e1ba78cae1 *firmware/rk3566-speaker.dtb
+503b5fa1372f97c687702c65d8198cf085277a02bbcf053c0cc2b3e1ba78cae1 *firmware/rk3566-guomeiyun.dtb
